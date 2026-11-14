@@ -1,0 +1,1154 @@
+﻿=== FILE: C:\Users\Alaa P11\AndroidStudioProjects\untitled2\lib\main.dart ===
+import 'dart:io';
+import 'dart:ui';
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'services/file_service.dart';
+import 'services/tts_service.dart';
+import 'widgets/gemini_background.dart';
+import 'database/db_helper.dart';
+
+void main() {
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'AI Reader Pro',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        colorSchemeSeed: Colors.cyanAccent,
+        useMaterial3: true,
+      ),
+      home: const ReaderPage(),
+      locale: const Locale('ar', ''),
+      builder: (context, child) {
+        return Directionality(
+          textDirection: TextDirection.rtl,
+          child: child!,
+        );
+      },
+    );
+  }
+}
+
+class ReaderPage extends StatefulWidget {
+  const ReaderPage({super.key});
+
+  @override
+  State<ReaderPage> createState() => _ReaderPageState();
+}
+
+class _ReaderPageState extends State<ReaderPage> with SingleTickerProviderStateMixin {
+  final FileService _fileService = FileService();
+  final TtsService _ttsService = TtsService();
+  final DatabaseHelper _dbHelper = DatabaseHelper.instance;
+
+  List<String> _segments = [];
+  int _currentSegmentIndex = -1;
+  bool _isLoading = false;
+  List<Map<String, String>> _arabicVoices = [];
+  String? _selectedVoiceName;
+  double _playbackSpeed = 1.0;
+  
+  List<Map<String, dynamic>> _library = [];
+  List<Map<String, dynamic>> _favorites = [];
+  int? _activeBookId;
+  String _activeBookTitle = "";
+  
+  bool _isAutoPlay = true;
+  TabController? _tabController;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+    _loadVoices();
+    _loadLibrary();
+    _loadFavorites();
+    
+    _ttsService.onStateChanged = (state) {
+      if (mounted) setState(() {});
+    };
+    
+    // Ø§Ù„Ø§Ù†ØªÙ‚Ø§Ù„ Ø§Ù„ØªÙ„Ù‚Ø§Ø¦ÙŠ Ù„Ù„Ù…Ù‚Ø·Ø¹ Ø§Ù„ØªØ§Ù„ÙŠ
+    _ttsService.onCompletion = () {
+      if (_isAutoPlay && _currentSegmentIndex < _segments.length - 1) {
+        _handlePlayPause(_currentSegmentIndex + 1);
+      }
+    };
+  }
+
+  Future<void> _loadLibrary() async {
+    final books = await _dbHelper.queryAllBooks();
+    setState(() => _library = books);
+  }
+
+  Future<void> _loadFavorites() async {
+    final favs = await _dbHelper.queryAllFavorites();
+    setState(() => _favorites = favs);
+  }
+
+  Future<void> _loadVoices() async {
+    final voices = await _ttsService.getVoices();
+    setState(() {
+      _arabicVoices = voices;
+      if (_arabicVoices.isNotEmpty) {
+        _selectedVoiceName = _arabicVoices[0]["name"];
+        _ttsService.setVoice(_arabicVoices[0]);
+      }
+    });
+  }
+
+  Future<void> _pickAndLoadFile() async {
+    setState(() => _isLoading = true);
+    File? file = await _fileService.pickFile();
+    if (file != null) {
+      List<String> segments = await _fileService.extractText(file);
+      if (segments.isNotEmpty) {
+        String title = file.path.split(Platform.pathSeparator).last;
+        int id = await _dbHelper.insertBook({
+          'title': title,
+          'path': file.path,
+          'content': jsonEncode(segments),
+          'lastSegmentIndex': 0,
+        });
+        setState(() {
+          _segments = segments;
+          _currentSegmentIndex = 0;
+          _activeBookId = id;
+          _activeBookTitle = title;
+          _isLoading = false;
+        });
+        _handlePlayPause(0);
+        _loadLibrary();
+        return;
+      }
+    }
+    setState(() => _isLoading = false);
+  }
+
+  static List<String> _parseContent(String content) {
+    return List<String>.from(jsonDecode(content));
+  }
+
+  Future<void> _loadBookFromLibrary(int bookId) async {
+    setState(() => _isLoading = true);
+    final bookData = await _dbHelper.getBookContent(bookId);
+    if (bookData != null) {
+      final segments = await compute(_parseContent, bookData['content'] as String);
+      setState(() {
+        _segments = segments;
+        _currentSegmentIndex = bookData['lastSegmentIndex'] ?? 0;
+        _activeBookId = bookId;
+        _activeBookTitle = bookData['title'] ?? "";
+        _isLoading = false;
+      });
+      if (_segments.isNotEmpty) _handlePlayPause(_currentSegmentIndex);
+    } else {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  void _handlePlayPause(int index) {
+    if (_currentSegmentIndex == index && _ttsService.state == TtsState.playing) {
+      _ttsService.pause();
+    } else {
+      setState(() => _currentSegmentIndex = index);
+      _ttsService.speak(_segments[index]);
+      if (_activeBookId != null) {
+        _dbHelper.updatePosition(_activeBookId!, index);
+      }
+    }
+  }
+
+  // Ù…ÙŠØ²Ø© Ø§Ù„Ù…Ø´Ø§Ø±ÙƒØ© ÙˆØ§Ù„ØªØµØ¯ÙŠØ±
+  Future<void> _exportAndShare(String text, String title) async {
+    var status = await Permission.storage.request();
+    if (status.isGranted || true) { // simplified for demo
+      setState(() => _isLoading = true);
+      String fileName = "${title}_part_${DateTime.now().millisecondsSinceEpoch}";
+      String? path = await _ttsService.exportAudio(text, fileName);
+      setState(() => _isLoading = false);
+      
+      if (path != null) {
+        Share.shareXFiles([XFile(path)], text: 'Ø§Ø³ØªÙ…Ø¹ Ø¥Ù„Ù‰ Ù‡Ø°Ø§ Ø§Ù„Ù…Ù‚Ø·Ø¹ Ù…Ù†: $title');
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('ÙØ´Ù„ ØªØµØ¯ÙŠØ± Ø§Ù„Ù…Ù„Ù Ø§Ù„ØµÙˆØªÙŠ Ø¹Ù„Ù‰ Ù‡Ø°Ø§ Ø§Ù„Ø¬Ù‡Ø§Ø²')),
+        );
+      }
+    }
+  }
+
+  // Ø¥Ø¶Ø§ÙØ© Ù„Ù„Ù…ÙØ¶Ù„Ø©
+  void _toggleFavorite(int index) async {
+    await _dbHelper.insertFavorite({
+      'bookId': _activeBookId,
+      'segmentIndex': index,
+      'text': _segments[index],
+      'title': _activeBookTitle,
+      'timestamp': DateTime.now().toIso8601String(),
+    });
+    _loadFavorites();
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('ØªÙ…Øª Ø§Ù„Ø¥Ø¶Ø§ÙØ© Ø¥Ù„Ù‰ Ø§Ù„Ù…Ø­ÙÙˆØ¸Ø§Øª')),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    double audioIntensity = _ttsService.state == TtsState.playing ? 0.6 : 0.0;
+    bool hasActiveBook = _segments.isNotEmpty;
+
+    return Scaffold(
+      extendBodyBehindAppBar: true,
+      appBar: AppBar(
+        title: Text(hasActiveBook ? _activeBookTitle : 'Ø§Ù„Ù‚Ø§Ø±Ø¦ Ø§Ù„Ø°ÙƒÙŠ Pro', 
+          style: const TextStyle(fontWeight: FontWeight.bold)),
+        centerTitle: true,
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        leading: hasActiveBook ? IconButton(
+          icon: const Icon(Icons.close),
+          onPressed: () => setState(() {
+            _segments = [];
+            _activeBookId = null;
+            _ttsService.stop();
+          }),
+        ) : null,
+        actions: [
+          _buildSpeedSelector(),
+          _buildVoiceSelector(),
+        ],
+      ),
+      body: Stack(
+        children: [
+          GeminiBackground(intensity: audioIntensity),
+          SafeArea(
+            child: _isLoading
+                ? const Center(child: CircularProgressIndicator(color: Colors.cyanAccent))
+                : !hasActiveBook
+                    ? _buildHomeTabs()
+                    : _buildSegmentList(),
+          ),
+        ],
+      ),
+      floatingActionButton: !hasActiveBook ? FloatingActionButton.extended(
+        onPressed: _pickAndLoadFile,
+        label: const Text('Ø¥Ø¶Ø§ÙØ© ÙƒØªØ§Ø¨'),
+        icon: const Icon(Icons.add),
+        backgroundColor: Colors.cyanAccent.withOpacity(0.2),
+      ) : null,
+      bottomNavigationBar: hasActiveBook ? _buildGlassyControlBar() : null,
+    );
+  }
+
+  Widget _buildHomeTabs() {
+    return Column(
+      children: [
+        TabBar(
+          controller: _tabController,
+          indicatorColor: Colors.cyanAccent,
+          tabs: const [
+            Tab(icon: Icon(Icons.library_books), text: 'Ø§Ù„Ù…ÙƒØªØ¨Ø©'),
+            Tab(icon: Icon(Icons.bookmark), text: 'Ø§Ù„Ù…Ø­ÙÙˆØ¸Ø§Øª'),
+          ],
+        ),
+        Expanded(
+          child: TabBarView(
+            controller: _tabController,
+            children: [
+              _buildLibraryView(),
+              _buildFavoritesView(),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSpeedSelector() {
+    return PopupMenuButton<double>(
+      icon: const Icon(Icons.speed),
+      onSelected: (speed) {
+        setState(() => _playbackSpeed = speed);
+        _ttsService.setSpeed(speed);
+      },
+      itemBuilder: (context) => [0.5, 0.75, 1.0, 1.25, 1.5, 2.0].map((s) {
+        return PopupMenuItem(value: s, child: Text('${s}x'));
+      }).toList(),
+    );
+  }
+
+  Widget _buildLibraryView() {
+    if (_library.isEmpty) return _buildEmptyState('Ø§Ù„Ù…ÙƒØªØ¨Ø© ÙØ§Ø±ØºØ©');
+    return ListView.builder(
+      padding: const EdgeInsets.all(15),
+      itemCount: _library.length,
+      itemBuilder: (context, index) {
+        final book = _library[index];
+        return Card(
+          color: Colors.white.withOpacity(0.05),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+          child: ListTile(
+            leading: const Icon(Icons.menu_book, color: Colors.cyanAccent),
+            title: Text(book['title']),
+            subtitle: Text('Ø¢Ø®Ø± Ù…Ù‚Ø·Ø¹: ${book['lastSegmentIndex']}'),
+            trailing: IconButton(
+              icon: const Icon(Icons.delete, color: Colors.redAccent),
+              onPressed: () => _dbHelper.deleteBook(book['id']).then((_) => _loadLibrary()),
+            ),
+            onTap: () => _loadBookFromLibrary(book['id']),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildFavoritesView() {
+    if (_favorites.isEmpty) return _buildEmptyState('Ù„Ø§ ØªÙˆØ¬Ø¯ Ù…Ø­ÙÙˆØ¸Ø§Øª');
+    return ListView.builder(
+      padding: const EdgeInsets.all(15),
+      itemCount: _favorites.length,
+      itemBuilder: (context, index) {
+        final fav = _favorites[index];
+        return Card(
+          color: Colors.white.withOpacity(0.05),
+          child: ListTile(
+            title: Text(fav['text'], maxLines: 2, overflow: TextOverflow.ellipsis),
+            subtitle: Text(fav['title']),
+            trailing: IconButton(
+              icon: const Icon(Icons.share, color: Colors.cyanAccent),
+              onPressed: () => _exportAndShare(fav['text'], fav['title']),
+            ),
+            onTap: () {
+              // ØªØ´ØºÙŠÙ„ Ø§Ù„Ù…Ù‚Ø·Ø¹ Ø§Ù„Ù…Ø­ÙÙˆØ¸
+              _ttsService.speak(fav['text']);
+            },
+            onLongPress: () => _dbHelper.deleteFavorite(fav['id']).then((_) => _loadFavorites()),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildVoiceSelector() {
+    return PopupMenuButton<String>(
+      tooltip: 'Ø§Ø®ØªØ± Ø§Ù„ØµÙˆØª',
+      icon: const Icon(Icons.record_voice_over),
+      onSelected: (val) {
+        if (val == "__refresh__") {
+          _loadVoices();
+          return;
+        }
+        setState(() => _selectedVoiceName = val);
+        final voice = _arabicVoices.firstWhere((v) => v["name"] == val);
+        _ttsService.setVoice(voice);
+      },
+      itemBuilder: (context) {
+        List<PopupMenuEntry<String>> items = _arabicVoices.map((v) {
+          bool isSelected = _selectedVoiceName == v["name"];
+          return PopupMenuItem<String>(
+            value: v["name"],
+            child: Row(
+              children: [
+                if (isSelected) const Icon(Icons.check, size: 18, color: Colors.cyanAccent),
+                if (isSelected) const SizedBox(width: 8),
+                Expanded(child: Text(v["displayName"] ?? v["name"]!, style: TextStyle(fontSize: 12, color: isSelected ? Colors.cyanAccent : null))),
+              ],
+            ),
+          );
+        }).toList();
+        
+        items.insert(0, const PopupMenuItem<String>(
+          value: "__refresh__",
+          child: Row(
+            children: [
+              Icon(Icons.refresh, size: 18),
+              SizedBox(width: 8),
+              Text('ØªØ­Ø¯ÙŠØ« Ù‚Ø§Ø¦Ù…Ø© Ø§Ù„Ø£ØµÙˆØ§Øª', style: TextStyle(fontSize: 12)),
+            ],
+          ),
+        ));
+        
+        if (_arabicVoices.isEmpty) {
+          items.add(const PopupMenuItem(enabled: false, child: Text('Ù„Ø§ ØªÙˆØ¬Ø¯ Ø£ØµÙˆØ§Øª Ø¹Ø±Ø¨ÙŠØ© Ù…Ø«Ø¨ØªØ©')));
+        }
+        
+        return items;
+      },
+    );
+  }
+
+  Widget _buildEmptyState(String msg) {
+    return Center(child: Text(msg, style: const TextStyle(color: Colors.white38)));
+  }
+
+  Widget _buildSegmentList() {
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 10),
+      itemCount: _segments.length,
+      itemBuilder: (context, index) {
+        bool isCurrent = _currentSegmentIndex == index;
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 300),
+          margin: const EdgeInsets.only(bottom: 10),
+          decoration: BoxDecoration(
+            color: isCurrent ? Colors.cyanAccent.withOpacity(0.1) : Colors.white.withOpacity(0.03),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Column(
+            children: [
+              ListTile(
+                title: SelectableText( // ØªÙ…ÙƒÙŠÙ† Ø§Ù„ØªØ­Ø¯ÙŠØ¯ Ø§Ù„ÙŠØ¯ÙˆÙŠ
+                  _segments[index],
+                  style: TextStyle(color: isCurrent ? Colors.cyanAccent : Colors.white70),
+                ),
+                leading: Icon(
+                  isCurrent && _ttsService.state == TtsState.playing ? Icons.pause : Icons.play_arrow,
+                  color: isCurrent ? Colors.cyanAccent : Colors.white24,
+                ),
+                onTap: () => _handlePlayPause(index),
+              ),
+              if (isCurrent)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8.0),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.bookmark_add, size: 20),
+                        onPressed: () => _toggleFavorite(index),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.share, size: 20),
+                        onPressed: () => _exportAndShare(_segments[index], _activeBookTitle),
+                      ),
+                    ],
+                  ),
+                )
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildGlassyControlBar() {
+    TtsState state = _ttsService.state;
+    return ClipRRect(
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+        child: Container(
+          height: 80,
+          color: Colors.black.withOpacity(0.4),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              Text('${_playbackSpeed}x', style: const TextStyle(color: Colors.cyanAccent)),
+              IconButton(
+                icon: Icon(state == TtsState.playing ? Icons.pause_circle : Icons.play_circle, size: 50, color: Colors.cyanAccent),
+                onPressed: () => _handlePlayPause(_currentSegmentIndex),
+              ),
+              Switch(
+                value: _isAutoPlay,
+                activeColor: Colors.cyanAccent,
+                onChanged: (val) => setState(() => _isAutoPlay = val),
+              ),
+              const Text('ØªÙ„Ù‚Ø§Ø¦ÙŠ', style: TextStyle(fontSize: 10)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+
+=== FILE: C:\Users\Alaa P11\AndroidStudioProjects\untitled2\lib\database\db_helper.dart ===
+import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart';
+
+class DatabaseHelper {
+  static final DatabaseHelper instance = DatabaseHelper._init();
+  static Database? _database;
+
+  DatabaseHelper._init();
+
+  Future<Database> get database async {
+    if (_database != null) return _database!;
+    _database = await _initDB('reader.db');
+    return _database!;
+  }
+
+  Future<Database> _initDB(String filePath) async {
+    final dbPath = await getDatabasesPath();
+    final path = join(dbPath, filePath);
+
+    return await openDatabase(
+      path,
+      version: 3, // ØªØ±Ù‚ÙŠØ© Ø§Ù„Ù†Ø³Ø®Ø© Ù„Ø¥Ø¶Ø§ÙØ© Ø¬Ø¯ÙˆÙ„ Ø§Ù„Ù…ÙØ¶Ù„Ø©
+      onCreate: _createDB,
+      onUpgrade: _onUpgrade,
+    );
+  }
+
+  Future _createDB(Database db, int version) async {
+    await db.execute('''
+      CREATE TABLE books (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        path TEXT,
+        content TEXT,
+        lastSegmentIndex INTEGER
+      )
+    ''');
+    
+    await db.execute('''
+      CREATE TABLE favorites (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bookId INTEGER,
+        segmentIndex INTEGER,
+        text TEXT,
+        title TEXT,
+        timestamp TEXT
+      )
+    ''');
+    
+    await db.execute('CREATE INDEX idx_books_id ON books(id)');
+  }
+
+  Future _onUpgrade(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 3) {
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS favorites (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          bookId INTEGER,
+          segmentIndex INTEGER,
+          text TEXT,
+          title TEXT,
+          timestamp TEXT
+        )
+      ''');
+    }
+  }
+
+  // Ø¹Ù…Ù„ÙŠØ§Øª Ø§Ù„ÙƒØªØ¨
+  Future<int> insertBook(Map<String, dynamic> book) async {
+    final db = await instance.database;
+    return await db.transaction((txn) async {
+      return await txn.insert('books', book);
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> queryAllBooks() async {
+    final db = await instance.database;
+    return await db.query('books', columns: ['id', 'title', 'lastSegmentIndex'], orderBy: 'id DESC');
+  }
+
+  Future<Map<String, dynamic>?> getBookContent(int id) async {
+    final db = await instance.database;
+    final results = await db.query('books', where: 'id = ?', whereArgs: [id], limit: 1);
+    return results.isNotEmpty ? results.first : null;
+  }
+
+  Future<int> updatePosition(int id, int segmentIndex) async {
+    final db = await instance.database;
+    return await db.update('books', {'lastSegmentIndex': segmentIndex}, where: 'id = ?', whereArgs: [id]);
+  }
+
+  Future<int> deleteBook(int id) async {
+    final db = await instance.database;
+    return await db.delete('books', where: 'id = ?', whereArgs: [id]);
+  }
+
+  // Ø¹Ù…Ù„ÙŠØ§Øª Ø§Ù„Ù…ÙØ¶Ù„Ø©
+  Future<int> insertFavorite(Map<String, dynamic> fav) async {
+    final db = await instance.database;
+    return await db.insert('favorites', fav);
+  }
+
+  Future<List<Map<String, dynamic>>> queryAllFavorites() async {
+    final db = await instance.database;
+    return await db.query('favorites', orderBy: 'id DESC');
+  }
+
+  Future<int> deleteFavorite(int id) async {
+    final db = await instance.database;
+    return await db.delete('favorites', where: 'id = ?', whereArgs: [id]);
+  }
+}
+
+
+
+=== FILE: C:\Users\Alaa P11\AndroidStudioProjects\untitled2\lib\services\arabic_processor.dart ===
+class ArabicProcessor {
+  static String cleanText(String input) {
+    if (input.isEmpty) return "";
+
+    String result = input;
+    
+    // 1. Normalize Arabic Presentation Forms (A & B) to standard Arabic range
+    // This is crucial for PDF text extraction which often uses these forms.
+    result = _normalizePresentationForms(result);
+
+    // 2. Handle common Ligatures that might still be present
+    final Map<String, String> ligatures = {
+      '\uFEFB': 'Ù„Ø§', 
+      '\uFEFC': 'Ù„Ø§', 
+      '\uFEF7': 'Ù„Ø£', 
+      '\uFEF8': 'Ù„Ø£', 
+      '\uFEF9': 'Ù„Ø¥', 
+      '\uFEFA': 'Ù„Ø¥', 
+      '\uFEF5': 'Ù„Ø¢', 
+      '\uFEF6': 'Ù„Ø¢',
+    };
+
+    ligatures.forEach((key, value) {
+      result = result.replaceAll(key, value);
+    });
+
+    // 3. Remove Directional marks
+    result = result.replaceAll(RegExp(r'[\u200e\u200f\u202a-\u202e]'), '');
+
+    // 4. Normalize whitespace
+    result = result.replaceAll(RegExp(r'\s+'), ' ');
+
+    return result.trim();
+  }
+
+  /// Maps Arabic Presentation Forms to their basic counterparts
+  static String _normalizePresentationForms(String input) {
+    StringBuffer buffer = StringBuffer();
+    for (int i = 0; i < input.length; i++) {
+      int code = input.codeUnitAt(i);
+      
+      // Presentation Forms B (U+FE70 - U+FEFF)
+      if (code >= 0xFE70 && code <= 0xFEFF) {
+        buffer.write(_mapPresentationFormB(code));
+      } 
+      // Presentation Forms A (U+FB50 - U+FDFF)
+      else if (code >= 0xFB50 && code <= 0xFDFF) {
+        buffer.write(_mapPresentationFormA(code));
+      }
+      else {
+        buffer.write(String.fromCharCode(code));
+      }
+    }
+    return buffer.toString();
+  }
+
+  /// Simplified mapping for common B forms. 
+  /// In a full implementation, this would be a complete lookup table.
+  static String _mapPresentationFormB(int code) {
+    // This is a subset for demonstration/common cases. 
+    // Ideally use a library or a full map.
+    if (code >= 0xFE80 && code <= 0xFE88) return 'Ø¡'; // Hamza variants
+    if (code >= 0xFE89 && code <= 0xFE8C) return 'Ø¦';
+    if (code >= 0xFE8D && code <= 0xFE8E) return 'Ø§';
+    if (code >= 0xFE8F && code <= 0xFE92) return 'Ø¨';
+    if (code >= 0xFE93 && code <= 0xFE94) return 'Ø©';
+    if (code >= 0xFE95 && code <= 0xFE98) return 'Øª';
+    if (code >= 0xFE99 && code <= 0xFE9C) return 'Ø«';
+    if (code >= 0xFE9D && code <= 0xFEA0) return 'Ø¬';
+    if (code >= 0xFEA1 && code <= 0xFEA4) return 'Ø­';
+    if (code >= 0xFEA5 && code <= 0xFEA8) return 'Ø®';
+    if (code >= 0xFEA9 && code <= 0xFEAA) return 'Ø¯';
+    if (code >= 0xFEAB && code <= 0xFEAC) return 'Ø°';
+    if (code >= 0xFEAD && code <= 0xFEAE) return 'Ø±';
+    if (code >= 0xFEAF && code <= 0xFEB0) return 'Ø²';
+    if (code >= 0xFEB1 && code <= 0xFEB4) return 'Ø³';
+    if (code >= 0xFEB5 && code <= 0xFEB8) return 'Ø´';
+    if (code >= 0xFEB9 && code <= 0xFEBC) return 'Øµ';
+    if (code >= 0xFEBD && code <= 0xFEC0) return 'Ø¶';
+    if (code >= 0xFEC1 && code <= 0xFEC4) return 'Ø·';
+    if (code >= 0xFEC5 && code <= 0xFEC8) return 'Ø¸';
+    if (code >= 0xFEC9 && code <= 0xFECC) return 'Ø¹';
+    if (code >= 0xFECD && code <= 0xFED0) return 'Øº';
+    if (code >= 0xFED1 && code <= 0xFED4) return 'Ù';
+    if (code >= 0xFED5 && code <= 0xFED8) return 'Ù‚';
+    if (code >= 0xFED9 && code <= 0xFEDC) return 'Ùƒ';
+    if (code >= 0xFEDD && code <= 0xFEE0) return 'Ù„';
+    if (code >= 0xFEE1 && code <= 0xFEE4) return 'Ù…';
+    if (code >= 0xFEE5 && code <= 0xFEE8) return 'Ù†';
+    if (code >= 0xFEE9 && code <= 0xFEEC) return 'Ù‡';
+    if (code >= 0xFEED && code <= 0xFEEE) return 'Ùˆ';
+    if (code >= 0xFEEF && code <= 0xFEF0) return 'Ù‰';
+    if (code >= 0xFEF1 && code <= 0xFEF4) return 'ÙŠ';
+    
+    return String.fromCharCode(code);
+  }
+
+  static String _mapPresentationFormA(int code) {
+    // Basic mapping for common A forms (Ligatures)
+    if (code == 0xFDFA) return 'ØµÙ„Ù‰ Ø§Ù„Ù„Ù‡ Ø¹Ù„ÙŠÙ‡ ÙˆØ³Ù„Ù…';
+    if (code == 0xFDFB) return 'Ø¬Ù„ Ø¬Ù„Ø§Ù„Ù‡';
+    return String.fromCharCode(code);
+  }
+
+  /// Fixes spacing and attempts to detect reversed text
+  static String fixWordSpacing(String input) {
+    if (input.isEmpty) return "";
+    
+    String text = input;
+    
+    // 1. Join characters separated by spaces (L E T T E R S)
+    StringBuffer buffer = StringBuffer();
+    List<String> parts = text.split(' ');
+    
+    for (int i = 0; i < parts.length; i++) {
+      String current = parts[i];
+      if (current.isEmpty) continue;
+
+      if (current.length == 1 && _isArabic(current)) {
+        buffer.write(current);
+        bool nextIsSingleArabic = false;
+        if (i + 1 < parts.length && parts[i+1].length == 1 && _isArabic(parts[i+1])) {
+          nextIsSingleArabic = true;
+        }
+        
+        if (!nextIsSingleArabic) {
+          buffer.write(' ');
+        }
+      } else {
+        buffer.write(current);
+        buffer.write(' ');
+      }
+    }
+    
+    String result = buffer.toString().trim().replaceAll(RegExp(r'\s+'), ' ');
+
+    // 2. Fix missing spaces after non-joining characters (Ø§ Ø¯ Ø° Ø± Ø² Ùˆ)
+    // This is common in PDF extraction where "Ùˆ Ù‚Ø§Ù„" becomes "ÙˆÙ‚Ø§Ù„"
+    // We look for these characters followed by something that looks like a new word.
+    // Extremely common case: 'Ùˆ' followed by a word
+    result = result.replaceAllMapped(
+      RegExp(r'(\s[Ùˆ])([\u0627-\u064A])'),
+      (m) => '${m[1]} ${m[2]}'
+    );
+
+    return result;
+  }
+
+  static bool _isLikelyReversed(String input) {
+    // Simple heuristic: if the first few Arabic characters are mostly "end of word" forms
+    // or if the text starts with punctuation that usually ends a sentence.
+    // For simplicity, we'll check for a high frequency of RTL characters in a LTR context
+    // or specific common patterns.
+    return false; // Placeholder for now
+  }
+
+  static String _reverseArabic(String input) {
+    return input.split('').reversed.join('');
+  }
+
+  static bool _isArabic(String char) {
+    if (char.isEmpty) return false;
+    int code = char.codeUnitAt(0);
+    return (code >= 0x0600 && code <= 0x06FF);
+  }
+}
+
+
+
+=== FILE: C:\Users\Alaa P11\AndroidStudioProjects\untitled2\lib\services\file_service.dart ===
+import 'dart:io';
+import 'package:flutter/foundation.dart';
+import 'package:syncfusion_flutter_pdf/pdf.dart';
+import 'package:docx_to_text/docx_to_text.dart';
+import 'package:file_picker/file_picker.dart';
+import 'dart:typed_data';
+import 'arabic_processor.dart';
+
+class FileService {
+  Future<File?> pickFile() async {
+    // Standard FilePicker result call
+    FilePickerResult? result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['pdf', 'docx'],
+    );
+
+    if (result != null && result.files.single.path != null) {
+      return File(result.files.single.path!);
+    }
+    return null;
+  }
+
+  static List<String> _processText(String rawText) {
+    String processedText = ArabicProcessor.cleanText(rawText);
+    processedText = ArabicProcessor.fixWordSpacing(processedText);
+
+    return processedText
+        .split(RegExp(r'(?<=[.!?])\s+|\n+'))
+        .map((s) => s.trim())
+        .where((s) => s.length > 5)
+        .toList();
+  }
+
+  Future<List<String>> extractText(File file) async {
+    String extension = file.path.split('.').last.toLowerCase();
+    String rawText = "";
+
+    try {
+      if (extension == 'pdf') {
+        rawText = await _extractFromPdf(file);
+      } else if (extension == 'docx') {
+        rawText = await _extractFromDocx(file);
+      }
+    } catch (e) {
+      print("Extraction Error: $e");
+      return ["Ø­Ø¯Ø« Ø®Ø·Ø£ Ø£Ø«Ù†Ø§Ø¡ Ø§Ø³ØªØ®Ø±Ø§Ø¬ Ø§Ù„Ù†Øµ Ù…Ù† Ø§Ù„Ù…Ù„Ù."];
+    }
+
+    if (rawText.isEmpty) return ["Ù„Ù… ÙŠØªÙ… Ø§Ù„Ø¹Ø«ÙˆØ± Ø¹Ù„Ù‰ Ù†Øµ Ù‚Ø§Ø¨Ù„ Ù„Ù„Ù‚Ø±Ø§Ø¡Ø©."];
+
+    // Use compute to run processing in a separate isolate to avoid UI lag
+    return await compute(_processText, rawText);
+  }
+
+  Future<String> _extractFromPdf(File file) async {
+    final Uint8List bytes = await file.readAsBytes();
+    final PdfDocument document = PdfDocument(inputBytes: bytes);
+    String text = PdfTextExtractor(document).extractText();
+    document.dispose();
+    return text;
+  }
+
+  Future<String> _extractFromDocx(File file) async {
+    final Uint8List bytes = await file.readAsBytes();
+    return docxToText(bytes);
+  }
+}
+
+
+
+=== FILE: C:\Users\Alaa P11\AndroidStudioProjects\untitled2\lib\services\tts_service.dart ===
+import 'package:flutter_tts/flutter_tts.dart';
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
+
+enum TtsState { playing, paused, stopped }
+
+class TtsService {
+  final FlutterTts _flutterTts = FlutterTts();
+  TtsState _state = TtsState.stopped;
+  
+  int _lastProgress = 0;
+  String _currentFullText = "";
+  Function(int)? onSegmentComplete;
+  Function(TtsState)? onStateChanged;
+  Function? onCompletion;
+
+  TtsService() {
+    _initTts();
+  }
+
+  void _initTts() async {
+    // We don't force a specific engine immediately to allow default discovery
+    // but we ensure it's initialized.
+    
+    await _flutterTts.setVolume(1.0);
+    await _flutterTts.setSpeechRate(0.5); 
+    await _flutterTts.setPitch(1.0);
+
+    _flutterTts.setStartHandler(() {
+      _state = TtsState.playing;
+      onStateChanged?.call(_state);
+    });
+
+    _flutterTts.setCompletionHandler(() {
+      _state = TtsState.stopped;
+      onStateChanged?.call(_state);
+      onCompletion?.call();
+    });
+
+    _flutterTts.setErrorHandler((msg) {
+      _state = TtsState.stopped;
+      onStateChanged?.call(_state);
+      print("TTS Error: $msg");
+    });
+
+    _flutterTts.setProgressHandler((String text, int start, int end, String word) {
+      _lastProgress = start;
+    });
+    
+    // Warm up engines on Android to ensure all voices are visible
+    if (Platform.isAndroid) {
+      try {
+        var engines = await _flutterTts.getEngines;
+        print("Available Engines: $engines");
+      } catch(e) {}
+    }
+  }
+
+  Future<void> setSpeed(double speed) async {
+    // Flutter TTS speed ranges typically from 0.0 to 1.0
+    // Standard is usually around 0.5. We scale linearly.
+    double ttsSpeed = (speed * 0.5).clamp(0.0, 1.0);
+    await _flutterTts.setSpeechRate(ttsSpeed);
+  }
+
+  Future<List<Map<String, String>>> getVoices() async {
+    List<Map<String, String>> allArabicVoices = [];
+    Set<String> uniqueVoiceNames = {};
+
+    try {
+      List<dynamic> engines = [];
+      if (Platform.isAndroid) {
+        engines = await _flutterTts.getEngines;
+      } else {
+        engines = ["default"];
+      }
+
+      for (String engine in engines) {
+        if (Platform.isAndroid) {
+          await _flutterTts.setEngine(engine);
+          // Wait a bit for the engine to load voices
+          await Future.delayed(const Duration(milliseconds: 300));
+        }
+
+        List<dynamic>? voices = await _flutterTts.getVoices;
+        if (voices == null) continue;
+
+        for (var voice in voices) {
+          try {
+            String locale = voice["locale"]?.toString().toLowerCase() ?? "";
+            String name = voice["name"]?.toString() ?? "Unknown";
+            
+            if ((locale.contains("ar") || locale.startsWith("ar")) && !uniqueVoiceNames.contains(name)) {
+              uniqueVoiceNames.add(name);
+              
+              String country = "";
+              if (locale.contains("-")) {
+                country = " (${locale.split('-').last.toUpperCase()})";
+              } else if (locale.contains("_")) {
+                country = " (${locale.split('_').last.toUpperCase()})";
+              }
+              
+              String engineLabel = engine.contains("google") ? "Google" : 
+                                  engine.contains("samsung") ? "Samsung" : engine.split('.').last;
+
+              allArabicVoices.add({
+                "name": name,
+                "locale": voice["locale"].toString(),
+                "engine": Platform.isAndroid ? engine : "",
+                "displayName": "Ø§Ù„Ø¹Ø±Ø¨ÙŠØ©$country - $engineLabel - ${name.split('.').last}",
+              });
+            }
+          } catch (e) {
+            print("Voice parse error: $e");
+          }
+        }
+      }
+    } catch (e) {
+      print("Error fetching voices: $e");
+    }
+
+    if (allArabicVoices.isNotEmpty) {
+      allArabicVoices.sort((a, b) => a["displayName"]!.compareTo(b["displayName"]!));
+    }
+    
+    return allArabicVoices;
+  }
+
+  Future<void> setVoice(Map<String, String> voice) async {
+    // If the voice belongs to a specific engine, we might need to switch engines first on Android
+    if (Platform.isAndroid && voice.containsKey("engine") && voice["engine"]!.isNotEmpty) {
+      await _flutterTts.setEngine(voice["engine"]!);
+    }
+    
+    await _flutterTts.setVoice({
+      "name": voice["name"]!,
+      "locale": voice["locale"]!,
+    });
+    
+    // Re-verify language for the new voice
+    await _flutterTts.setLanguage(voice["locale"]!);
+  }
+
+  Future<void> speak(String text) async {
+    if (text.isEmpty) return;
+    
+    if (_state == TtsState.paused && _currentFullText == text) {
+      await resume();
+      return;
+    }
+
+    _currentFullText = text;
+    _lastProgress = 0;
+    
+    // Note: setLanguage is called during voice setting, 
+    // but we ensure Arabic context here as a fallback
+    if (_state != TtsState.playing) {
+      await _flutterTts.speak(text);
+    }
+  }
+
+  Future<String?> exportAudio(String text, String fileName) async {
+    try {
+      Directory? tempDir;
+      if (Platform.isAndroid) {
+        tempDir = await getExternalStorageDirectory();
+      }
+      if (tempDir == null) tempDir = await getApplicationDocumentsDirectory();
+      
+      String filePath = "${tempDir.path}/$fileName.wav";
+      
+      if (Platform.isAndroid) {
+        // synthesizeToFile in flutter_tts typically returns 1 for success
+        await _flutterTts.synthesizeToFile(text, "$fileName.wav");
+        
+        // Wait a moment for file to be written
+        File file = File(filePath);
+        int retry = 0;
+        while (!await file.exists() && retry < 10) {
+          await Future.delayed(Duration(milliseconds: 200));
+          retry++;
+        }
+        
+        return file.existsSync() ? filePath : null;
+      }
+      return null;
+    } catch (e) {
+      print("Export Error: $e");
+      return null;
+    }
+  }
+
+  Future<void> pause() async {
+    await _flutterTts.pause();
+    _state = TtsState.paused;
+    onStateChanged?.call(_state);
+  }
+
+  Future<void> resume() async {
+    if (_currentFullText.isEmpty) return;
+    
+    // Some engines don't support resume well, so we speak from last progress.
+    // We ensure we don't split in the middle of a multi-byte character or a word.
+    int startIndex = _lastProgress;
+    
+    // Safety check: if startIndex is in the middle of a word, try to find the start of the word
+    if (startIndex > 0 && startIndex < _currentFullText.length) {
+      while (startIndex > 0 && _currentFullText[startIndex] != ' ') {
+        startIndex--;
+      }
+      if (_currentFullText[startIndex] == ' ') startIndex++;
+    }
+
+    String remainingText = _currentFullText.substring(startIndex);
+    if (remainingText.isNotEmpty) {
+      await _flutterTts.speak(remainingText);
+    }
+  }
+
+  Future<void> stop() async {
+    await _flutterTts.stop();
+    _state = TtsState.stopped;
+    _lastProgress = 0;
+    onStateChanged?.call(_state);
+  }
+
+  TtsState get state => _state;
+}
+
+
+
+=== FILE: C:\Users\Alaa P11\AndroidStudioProjects\untitled2\lib\widgets\gemini_background.dart ===
+import 'dart:ui';
+import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
+import 'dart:async';
+
+class GeminiBackground extends StatefulWidget {
+  final double intensity;
+  const GeminiBackground({super.key, this.intensity = 0.0});
+
+  @override
+  State<GeminiBackground> createState() => _GeminiBackgroundState();
+}
+
+class _GeminiBackgroundState extends State<GeminiBackground> with SingleTickerProviderStateMixin {
+  FragmentShader? _shader;
+  late Ticker _ticker;
+  double _time = 0.0;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadShader();
+    _ticker = createTicker((elapsed) {
+      setState(() {
+        _time = elapsed.inMilliseconds / 1000.0;
+      });
+    });
+    _ticker.start();
+  }
+
+  Future<void> _loadShader() async {
+    final program = await FragmentProgram.fromAsset('assets/shaders/gemini_wave.frag');
+    setState(() {
+      _shader = program.fragmentShader();
+    });
+  }
+
+  @override
+  void dispose() {
+    _ticker.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_shader == null) return Container(color: const Color(0xFF020308));
+
+    return CustomPaint(
+      painter: GeminiWavePainter(
+        shader: _shader!,
+        time: _time,
+        intensity: widget.intensity,
+      ),
+      child: Container(),
+    );
+  }
+}
+
+class GeminiWavePainter extends CustomPainter {
+  final FragmentShader shader;
+  final double time;
+  final double intensity;
+
+  GeminiWavePainter({
+    required this.shader,
+    required this.time,
+    required this.intensity,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    shader.setFloat(0, time); // uTime
+    shader.setFloat(1, size.width); // uResolution.x
+    shader.setFloat(2, size.height); // uResolution.y
+    shader.setFloat(3, intensity); // uIntensity
+
+    final paint = Paint()..shader = shader;
+    canvas.drawRect(Offset.zero & size, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant GeminiWavePainter oldDelegate) => true;
+}
+
+
+
